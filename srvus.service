@@ -1,0 +1,13 @@
+[Service]
+ExecStart=/usr/local/bin/srvus
+ReadOnlyDirectories=/
+PrivateTmp=true
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target
+
+[Unit]
+After=network.target
