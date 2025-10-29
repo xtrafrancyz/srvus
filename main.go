@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base32"
@@ -517,6 +518,7 @@ func httpErrorOut(conn net.Conn, status string, message string) error {
 func (s *server) serveSSH() {
 	sshConfig := ssh.ServerConfig{
 		ServerVersion: "SSH-2.0-" + *domain + "-1.0",
+		NoClientAuth:  true,
 		BannerCallback: func(conn ssh.ConnMetadata) string {
 			return `
 Docs: ` + *docsUrl + `
@@ -546,26 +548,32 @@ Docs: ` + *docsUrl + `
 }
 
 func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Conn) {
-	var key *ssh.PublicKey
+	keyID := ""
+	noauth := false
 	config := sshConfig
 	config.PublicKeyCallback = func(conn ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
-		key = &k
+		keyID = base64.RawStdEncoding.EncodeToString(k.Marshal()[:])
+		return &ssh.Permissions{}, nil
+	}
+	config.NoClientAuthCallback = func(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
+		noauth = true
+		b := make([]byte, 32)
+		_, _ = cryptorand.Read(b)
+		keyID = base64.RawStdEncoding.EncodeToString(b)
 		return &ssh.Permissions{}, nil
 	}
 
 	conn, newChans, reqs, err := ssh.NewServerConn(*tcpConn, config)
-	if key == nil || err != nil {
+	if keyID == "" || err != nil {
 		return
 	}
 
-	keyID := base64.RawStdEncoding.EncodeToString((*key).Marshal()[:])
-
 	githubEnabled := false
-	if *githubSubdomains && conn.User() != "nomatch" {
+	if *githubSubdomains && !noauth && conn.User() != "nomatch" {
 		githubEnabled = keyMatchesAccount("github.com", conn.User(), keyID)
 	}
 	gitlabEnabled := false
-	if *gitlabSubdomains && conn.User() != "nomatch" {
+	if *gitlabSubdomains && !noauth && conn.User() != "nomatch" {
 		gitlabEnabled = keyMatchesAccount("gitlab.com", conn.User(), keyID)
 	}
 
@@ -745,7 +753,7 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 						}
 					}
 				} else if httpSupported {
-					endpoints := endpointURLs(conn.User(), key, payload.BindPort, githubEnabled, gitlabEnabled)
+					endpoints := endpointURLs(conn.User(), keyID, payload.BindPort, githubEnabled, gitlabEnabled)
 					atomic.AddInt32(&requested, 1)
 
 					var urls []string
@@ -816,7 +824,7 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 						}
 					}
 				} else if httpSupported {
-					endpoints := endpointURLs(conn.User(), key, payload.BindPort, githubEnabled, gitlabEnabled)
+					endpoints := endpointURLs(conn.User(), keyID, payload.BindPort, githubEnabled, gitlabEnabled)
 					atomic.AddInt32(&requested, 1)
 
 					s.Lock()
@@ -902,9 +910,9 @@ func (s *server) logStats() {
 	}
 }
 
-func endpointURLs(user string, key *ssh.PublicKey, port uint32, githubEnabled bool, gitlabEnabled bool) []string {
+func endpointURLs(user string, keyid string, port uint32, githubEnabled bool, gitlabEnabled bool) []string {
 	hasher := sha256.New()
-	_, _ = hasher.Write((*key).Marshal())
+	_, _ = hasher.Write([]byte(keyid))
 	_, _ = hasher.Write([]byte{0})
 	_, _ = hasher.Write([]byte(strconv.Itoa(int(port))))
 	b32 := b32encoder.EncodeToString(hasher.Sum(nil)[:16])
