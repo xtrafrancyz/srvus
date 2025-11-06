@@ -932,15 +932,16 @@ func endpointURLs(user string, keyid string, port uint32, githubEnabled bool, gi
 	_, _ = hasher.Write([]byte(strconv.Itoa(int(port))))
 	b32 := b32encoder.EncodeToString(hasher.Sum(nil)[:16])
 	result := []string{fmt.Sprintf("%s.%s", b32, *domain)}
+	lower := strings.ToLower(user)
 	if githubEnabled {
 		if port == 1 {
-			result = append(result, fmt.Sprintf("%s.gh.%s", user, *domain))
+			result = append(result, fmt.Sprintf("%s.gh.%s", lower, *domain))
 		} else {
-			result = append(result, fmt.Sprintf("%s--%d.gh.%s", user, port, *domain))
+			result = append(result, fmt.Sprintf("%s--%d.gh.%s", lower, port, *domain))
 		}
 	}
 	if gitlabEnabled {
-		result = append(result, fmt.Sprintf("%s-%d.gl.%s", user, port, *domain))
+		result = append(result, fmt.Sprintf("%s-%d.gl.%s", lower, port, *domain))
 	}
 	return result
 }
