@@ -117,21 +117,9 @@ type server struct {
 
 func newServer() *server {
 	return &server{
-		conns:        make(map[*ssh.ServerConn]*sshConnection),
-		endpoints:    make(map[string][]*target),
-		tcpListeners: make([]*tcpTarget, 0),
-		dns:          doh.Use(doh.GoogleProvider, doh.CloudflareProvider),
-	}
-}
-
-func (s *server) startSession(keyID string, conn *ssh.ServerConn, ch ssh.Channel) {
-	s.Lock()
-	defer s.Unlock()
-
-	if _, found := s.conns[conn]; !found {
-		s.conns[conn] = newConnection(keyID, ch)
-	} else {
-		s.conns[conn].Sessions = append(s.conns[conn].Sessions, ch)
+		conns:     make(map[*ssh.ServerConn]*sshConnection),
+		endpoints: make(map[string][]*target),
+		dns:       doh.Use(doh.GoogleProvider, doh.CloudflareProvider),
 	}
 }
 
@@ -150,12 +138,12 @@ func (s *server) newPort(conn *ssh.ServerConn) uint16 {
 func (s *server) insertEndpointTarget(endpoint string, t *target) {
 	log.Printf("%s(%s) on %s", t.Remote.RemoteAddr(), t.KeyID, endpoint)
 
-	if s.endpoints[endpoint] == nil {
-		s.endpoints[endpoint] = make([]*target, 0)
+	sConn, ok := s.conns[t.Remote]
+	if !ok {
+		return
 	}
-	s.endpoints[endpoint] = append(s.endpoints[endpoint], t)
 
-	sConn := s.conns[t.Remote]
+	s.endpoints[endpoint] = append(s.endpoints[endpoint], t)
 	sConn.TunnelRefs = append(sConn.TunnelRefs, &tunnelRef{
 		Endpoint: endpoint,
 		Target:   t,
@@ -177,10 +165,24 @@ func (s *server) removeEndpointTarget(endpoint string, t *target) {
 		delete(s.endpoints, endpoint)
 	}
 
-	sConn := s.conns[t.Remote]
+	sConn, ok := s.conns[t.Remote]
+	if !ok {
+		return
+	}
 	sConn.TunnelRefs = slices.DeleteFunc(sConn.TunnelRefs, func(ref *tunnelRef) bool {
 		return ref.Endpoint == endpoint && ref.Target == t
 	})
+}
+
+func (s *server) addTcpListener(t *tcpTarget) bool {
+	s.Lock()
+	defer s.Unlock()
+
+	if _, ok := s.conns[t.Target.Remote]; !ok {
+		return false
+	}
+	s.tcpListeners = append(s.tcpListeners, t)
+	return true
 }
 
 func (s *server) pickTarget(endpoint string) *target {
@@ -220,13 +222,16 @@ func (s *server) pickTarget(endpoint string) *target {
 	}
 }
 
-func newConnection(keyID string, ch ssh.Channel) *sshConnection {
-	return &sshConnection{
-		KeyID:      keyID,
-		Sessions:   []ssh.Channel{ch},
-		TunnelRefs: make([]*tunnelRef, 0),
-		lastPort:   0,
+func (s *server) startSession(conn *ssh.ServerConn, ch ssh.Channel) bool {
+	s.Lock()
+	defer s.Unlock()
+
+	if _, ok := s.conns[conn]; ok {
+		s.conns[conn].Sessions = append(s.conns[conn].Sessions, ch)
+		return true
 	}
+
+	return false
 }
 
 func (s *server) endSession(conn *ssh.ServerConn, ch ssh.Channel) {
@@ -250,6 +255,16 @@ func (s *server) endSession(conn *ssh.ServerConn, ch ssh.Channel) {
 		go func() {
 			_ = conn.Close()
 		}()
+	}
+}
+
+func (s *server) startConnection(conn *ssh.ServerConn, keyID string) {
+	s.Lock()
+	defer s.Unlock()
+
+	s.conns[conn] = &sshConnection{
+		KeyID:    keyID,
+		lastPort: 0,
 	}
 }
 
@@ -577,20 +592,22 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 		gitlabEnabled = keyMatchesAccount("gitlab.com", conn.User(), keyID)
 	}
 
+	s.startConnection(conn, keyID)
 	log.Printf("%s (%s) connected (%s, %s, gh:%v, gl:%v)",
 		conn.RemoteAddr(), keyID, conn.ClientVersion(), conn.User(), githubEnabled, gitlabEnabled)
 
 	// We want to have at least one session opened so we can send messages to it.
-	outputReady := false
 	outputReadyCh := make(chan struct{})
+	outputReadyChCloser := NewSafeCloser(outputReadyCh)
 	keepalives := make(chan struct{})
-	msgs := make(chan string)
+	msgs := make(chan string, 10)
 	ctx, cancel := context.WithCancel(context.Background())
 	requested := int32(0)
 
 	defer func() {
 		cancel()
 		close(msgs)
+		outputReadyChCloser.Close()
 		s.closeConnection(conn)
 	}()
 
@@ -599,6 +616,7 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 		select {
 		case <-ctx.Done():
 		case msgs <- colored:
+		default: // drop message if buffer full
 		}
 	}
 
@@ -633,13 +651,12 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 					return
 				}
 
-				s.startSession(keyID, conn, channel)
 				defer s.endSession(conn, channel)
-
-				if !outputReady {
-					close(outputReadyCh)
-					outputReady = true
+				if !s.startSession(conn, channel) {
+					return
 				}
+
+				outputReadyChCloser.Close()
 
 				go func() {
 					buf := make([]byte, 256)
@@ -734,12 +751,10 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 					port := listener.Addr().(*net.TCPAddr).Port
 					tgt.Port = uint32(port)
 
-					s.Lock()
-					s.tcpListeners = append(s.tcpListeners, &tcpTarget{
-						Listener: listener,
-						Target:   tgt,
-					})
-					s.Unlock()
+					if !s.addTcpListener(&tcpTarget{listener, tgt}) {
+						_ = listener.Close()
+						continue
+					}
 
 					log.Printf("%s listening tcp :%d", conn.RemoteAddr(), port)
 

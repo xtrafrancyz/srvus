@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -54,4 +55,24 @@ func NewCustomConn(conn net.Conn, reader io.Reader) net.Conn {
 		Reader: reader,
 		Conn:   conn,
 	}
+}
+
+// SafeCloser wraps a channel and provides a safe way to close it
+type SafeCloser[T any] struct {
+	C    chan T
+	once sync.Once
+}
+
+// NewSafeCloser creates a new SafeCloser for a given channel
+func NewSafeCloser[T any](ch chan T) *SafeCloser[T] {
+	return &SafeCloser[T]{
+		C: ch,
+	}
+}
+
+// Close closes the channel safely, ensuring it's only closed once
+func (sc *SafeCloser[T]) Close() {
+	sc.once.Do(func() {
+		close(sc.C)
+	})
 }
