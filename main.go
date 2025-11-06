@@ -109,10 +109,11 @@ type sshConnection struct {
 
 type server struct {
 	sync.Mutex
-	conns        map[*ssh.ServerConn]*sshConnection
-	endpoints    map[string][]*target
-	tcpListeners []*tcpTarget
-	dns          *doh.DoH
+	conns             map[*ssh.ServerConn]*sshConnection
+	endpoints         map[string][]*target
+	tcpListeners      []*tcpTarget
+	dns               *doh.DoH
+	activeClientConns int
 }
 
 func newServer() *server {
@@ -258,14 +259,16 @@ func (s *server) endSession(conn *ssh.ServerConn, ch ssh.Channel) {
 	}
 }
 
-func (s *server) startConnection(conn *ssh.ServerConn, keyID string) {
+func (s *server) startConnection(conn *ssh.ServerConn, keyID string) *sshConnection {
 	s.Lock()
 	defer s.Unlock()
 
-	s.conns[conn] = &sshConnection{
+	c := &sshConnection{
 		KeyID:    keyID,
 		lastPort: 0,
 	}
+	s.conns[conn] = c
+	return c
 }
 
 func (s *server) closeConnection(conn *ssh.ServerConn) {
@@ -449,7 +452,14 @@ func (s *server) pipeConns(name string, tgt *target, conn net.Conn) (pipeStats, 
 		return pipeStats{}, err
 	}
 
+	s.Lock()
+	s.activeClientConns++
+	s.Unlock()
 	defer func() {
+		s.Lock()
+		s.activeClientConns--
+		s.Unlock()
+
 		if err := sshChannel.Close(); err != nil && !errors.Is(err, io.EOF) {
 			log.Printf("%v:%s→%v channel close failed (%d)", tgt.Remote.RemoteAddr(), name, conn.RemoteAddr(), err)
 		}
@@ -472,7 +482,6 @@ func (s *server) pipeConns(name string, tgt *target, conn net.Conn) (pipeStats, 
 	go func() {
 		b, err := io.Copy(conn, sshChannel)
 		sent = b
-		//log.Printf("%v %s→%v xfer %d", tgt.Remote.RemoteAddr(), name, conn.RemoteAddr(), b)
 		if err != nil && !errors.Is(err, io.EOF) {
 			log.Printf("%v %s→%v copy failed (%v)", tgt.Remote.RemoteAddr(), name, conn.RemoteAddr(), err)
 		}
@@ -490,7 +499,6 @@ func (s *server) pipeConns(name string, tgt *target, conn net.Conn) (pipeStats, 
 	go func() {
 		b, err := io.Copy(sshChannel, conn)
 		recv = b
-		//log.Printf("%v %s←%v xfer %d", tgt.Remote.RemoteAddr(), name, conn.RemoteAddr(), b)
 		if err != nil && !errors.Is(err, io.EOF) {
 			log.Printf("%v %s←%v copy failed (%v)", tgt.Remote.RemoteAddr(), name, conn.RemoteAddr(), err)
 		}
@@ -533,7 +541,6 @@ func httpErrorOut(conn net.Conn, status string, message string) error {
 func (s *server) serveSSH() {
 	sshConfig := ssh.ServerConfig{
 		ServerVersion: "SSH-2.0-" + *domain + "-1.0",
-		NoClientAuth:  true,
 		BannerCallback: func(conn ssh.ConnMetadata) string {
 			return `
 Docs: ` + *docsUrl + `
@@ -570,7 +577,21 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 		keyID = base64.RawStdEncoding.EncodeToString(k.Marshal()[:])
 		return &ssh.Permissions{}, nil
 	}
-	config.NoClientAuthCallback = func(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
+	config.KeyboardInteractiveCallback = func(conn ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+		// Request zero input fields (no prompts needed).
+		// The challenge function is provided by the server to request info.
+		// Request 0 prompts (empty instruction, empty name, nil questions)
+		_, err := challenge("", "", nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		noauth = true
+		b := make([]byte, 32)
+		_, _ = cryptorand.Read(b)
+		keyID = base64.RawStdEncoding.EncodeToString(b)
+		return &ssh.Permissions{}, nil
+	}
+	config.PasswordCallback = func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 		noauth = true
 		b := make([]byte, 32)
 		_, _ = cryptorand.Read(b)
@@ -592,7 +613,7 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 		gitlabEnabled = keyMatchesAccount("gitlab.com", conn.User(), keyID)
 	}
 
-	s.startConnection(conn, keyID)
+	srvSshConn := s.startConnection(conn, keyID)
 	log.Printf("%s (%s) connected (%s, %s, gh:%v, gl:%v)",
 		conn.RemoteAddr(), keyID, conn.ClientVersion(), conn.User(), githubEnabled, gitlabEnabled)
 
@@ -700,12 +721,9 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 		<-outputReadyCh
 
 		for msg := range msgs {
-			c := s.conns[conn]
-			if c != nil {
-				for _, sess := range c.Sessions {
-					if _, err := sess.Write([]byte(msg + "\r\n")); err != nil {
-						log.Printf("Could not send message %s (%v)", msg, err)
-					}
+			for _, sess := range srvSshConn.Sessions {
+				if _, err := sess.Write([]byte(msg + "\r\n")); err != nil {
+					log.Printf("Could not send message %s (%v)", msg, err)
 				}
 			}
 		}
@@ -918,10 +936,31 @@ func keyMatchesAccount(domain, user, key string) bool {
 }
 
 func (s *server) logStats() {
+	type stats struct {
+		sshConns      int
+		tcpEndpoints  int
+		httpEndpoints int
+		clientConns   int
+	}
+	collect := func() stats {
+		s.Lock()
+		defer s.Unlock()
+		return stats{
+			sshConns:      len(s.conns),
+			tcpEndpoints:  len(s.tcpListeners),
+			httpEndpoints: len(s.endpoints),
+			clientConns:   s.activeClientConns,
+		}
+	}
+	prev := collect()
 	t := time.NewTicker(time.Minute)
 	for range t.C {
-
-		log.Printf("Stats: %d ssh conns, %d endpoints, %d client conns", len(s.conns), len(s.endpoints)+len(s.tcpListeners), 0)
+		curr := collect()
+		if curr == prev {
+			continue
+		}
+		prev = curr
+		log.Printf("Stats: %d ssh conns, endpoints: %d tcp; %d http, %d client conns", curr.sshConns, curr.tcpEndpoints, curr.httpEndpoints, curr.clientConns)
 	}
 }
 
