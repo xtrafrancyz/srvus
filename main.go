@@ -627,7 +627,6 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 
 	defer func() {
 		cancel()
-		close(msgs)
 		outputReadyChCloser.Close()
 		s.closeConnection(conn)
 	}()
