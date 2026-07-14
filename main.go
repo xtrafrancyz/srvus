@@ -564,12 +564,16 @@ Docs: ` + *docsUrl + `
 		if err != nil {
 			log.Printf("Failed to accept (%s)", err)
 		} else {
-			go s.serveSSHConnection(&sshConfig, &tcpConn)
+			go s.serveSSHConnection(&sshConfig, tcpConn)
 		}
 	}
 }
 
-func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Conn) {
+func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn net.Conn) {
+	defer func() {
+		_ = tcpConn.Close()
+	}()
+
 	keyID := ""
 	noauth := false
 	config := sshConfig
@@ -599,7 +603,7 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 		return &ssh.Permissions{}, nil
 	}
 
-	conn, newChans, reqs, err := ssh.NewServerConn(*tcpConn, config)
+	conn, newChans, reqs, err := ssh.NewServerConn(tcpConn, config)
 	if keyID == "" || err != nil {
 		return
 	}
@@ -620,7 +624,7 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 	// We want to have at least one session opened so we can send messages to it.
 	outputReadyCh := make(chan struct{})
 	outputReadyChCloser := NewSafeCloser(outputReadyCh)
-	keepalives := make(chan struct{})
+	keepalives := make(chan struct{}, 1)
 	msgs := make(chan string, 10)
 	ctx, cancel := context.WithCancel(context.Background())
 	requested := int32(0)
@@ -642,12 +646,21 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 
 	go func() {
 		t := time.NewTicker(5 * time.Second)
-		for range t.C {
-			if _, _, err := conn.SendRequest("keepalive@openssh.com", true, nil); err != nil {
-				close(keepalives)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			} else {
-				keepalives <- struct{}{}
+			case <-t.C:
+				if _, _, err := conn.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+					cancel()
+					return
+				}
+				select {
+				case keepalives <- struct{}{}:
+				default:
+				}
 			}
 		}
 	}()
@@ -719,14 +732,31 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 	go func() {
 		<-outputReadyCh
 
-		for msg := range msgs {
-			for _, sess := range srvSshConn.Sessions {
-				if _, err := sess.Write([]byte(msg + "\r\n")); err != nil {
-					log.Printf("Could not send message %s (%v)", msg, err)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-msgs:
+				for _, sess := range srvSshConn.Sessions {
+					if _, err := sess.Write([]byte(msg + "\r\n")); err != nil {
+						log.Printf("Could not send message %s (%v)", msg, err)
+					}
 				}
 			}
 		}
 	}()
+
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+	resetTimeout := func() {
+		if !timeout.Stop() {
+			select {
+			case <-timeout.C:
+			default:
+			}
+		}
+		timeout.Reset(10 * time.Second)
+	}
 
 	for {
 		select {
@@ -734,6 +764,7 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 			if req == nil {
 				return
 			}
+			resetTimeout()
 			switch req.Type {
 			case "tcpip-forward":
 				var payload remoteForwardRequest
@@ -894,7 +925,8 @@ func (s *server) serveSSHConnection(sshConfig *ssh.ServerConfig, tcpConn *net.Co
 				}
 			}
 		case <-keepalives:
-		case <-time.After(10 * time.Second):
+			resetTimeout()
+		case <-timeout.C:
 			log.Printf("%s(%s) timed out", conn.RemoteAddr(), keyID)
 			return
 		}
